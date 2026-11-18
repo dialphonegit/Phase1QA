@@ -1,12 +1,28 @@
-import json, hashlib, base64, urllib.request, time, sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""
+Fetch SIP credentials for N portal member accounts.
+Rate limit on /auth/login: 5 req / 68s per IP.
+Default: 1 request per 15s (safe). Override with --delay.
+
+Usage:
+  python3 fetch_creds.py                     # 200 accounts → /tmp/queue200_creds.json
+  python3 fetch_creds.py --total 50 --out /tmp/my_creds.json
+"""
+import argparse, json, hashlib, base64, urllib.request, time
 from Crypto.Cipher import AES
 
 API = "https://portal.qa.unifiedrtc.com/api/v1"
 KEY_SECRET = "auditcryptosecret0123456789abcde"
-TOTAL = 100
-WORKERS = 10
-OUT = "/tmp/creds_100.json"
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument('--total',  type=int,   default=200)
+_ap.add_argument('--start',  type=int,   default=2,    help='email suffix start')
+_ap.add_argument('--out',    default='/tmp/queue200_creds.json')
+_ap.add_argument('--delay',  type=float, default=15.0, help='seconds between logins')
+_args = _ap.parse_args()
+
+TOTAL   = _args.total
+WORKERS = 1
+OUT     = _args.out
 
 def http_post(url, data):
     body = json.dumps(data).encode()
@@ -35,38 +51,45 @@ def fetch(suffix):
             r = http_post(f"{API}/auth/login", {"email":email,"password":"Aadmin@123456!","device_type":"W"})
             tok = r["data"]["message"]["token"]
             r2 = http_get(f"{API}/sip/get-register-credentials", {"Authorization":f"Bearer {tok}"})
-            d = decrypt_sip(r2["data"]["data"]["sipDetail"])
-            return {"suffix":suffix,"ext":str(d["extension"]),"name":d["name"],"pw":d["password"]}
-        except Exception:
+            # Try both known response shapes
+            result = r2.get("data",{}).get("result",{}) or r2.get("data",{}).get("data",{})
+            enc = result.get("sip_detail") or result.get("sipDetail","")
+            if not enc:
+                raise ValueError("no sip_detail in response")
+            d = decrypt_sip(enc)
+            return {
+                "sip_user":  d.get("user") or d.get("name"),
+                "extension": str(d.get("extension") or d.get("ext")),
+                "domain":    d.get("domain","1792517466513.unifiedrtc.com"),
+                "password":  d.get("password") or d.get("pw"),
+                "email":     email,
+                "token":     tok,
+            }
+        except Exception as e:
             time.sleep(2 + attempt * 2)
     return None
 
-_throttle = __import__('threading').Semaphore(1)
-
-def fetch_throttled(suffix):
-    time.sleep(0.3)  # max ~3 req/s across 5 workers
-    return fetch(suffix)
-
-print(f"Fetching creds for {TOTAL} users ({WORKERS} threads, throttled)...", flush=True)
+print(f"Fetching creds for {TOTAL} users (1 at a time, {_args.delay}s delay)...", flush=True)
 t0 = time.time()
 users = []
-done = 0
 errors = 0
-suffixes = list(range(2, 2+TOTAL))
+suffixes = list(range(_args.start, _args.start + TOTAL))
 
-with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-    futs = {pool.submit(fetch_throttled, s): s for s in suffixes}
-    for fut in as_completed(futs):
-        done += 1
-        r = fut.result()
-        if r: users.append(r)
-        else: errors += 1
-        if done % 200 == 0:
-            elapsed = time.time()-t0
-            rate = done/elapsed if elapsed > 0 else 1
-            eta = (TOTAL-done)/rate
-            print(f"  {done}/{TOTAL} | OK:{len(users)} err:{errors} | {rate:.1f}/s ETA:{eta:.0f}s", flush=True)
+for i, s in enumerate(suffixes):
+    r = fetch(s)
+    if r:
+        users.append(r)
+    else:
+        errors += 1
+    done = i + 1
+    if done % 10 == 0:
+        elapsed = time.time() - t0
+        eta = (TOTAL - done) * _args.delay
+        print(f"  {done}/{TOTAL} | OK:{len(users)} err:{errors} | ETA:{eta:.0f}s", flush=True)
+    if done < TOTAL:
+        time.sleep(_args.delay)
 
-users.sort(key=lambda u: int(u["ext"]))
-with open(OUT, "w") as f: json.dump(users, f)
+users.sort(key=lambda u: int(u["extension"]))
+with open(OUT, "w") as f:
+    json.dump({"ts": time.time(), "creds": users}, f)
 print(f"DONE: {len(users)} creds saved → {OUT}  ({time.time()-t0:.0f}s)", flush=True)

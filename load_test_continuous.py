@@ -179,143 +179,145 @@ async def register(u):
         except: pass
         return None, str(e)
 
-# ── single call (registers fresh, calls, hangs up, closes) ───────────────────
-
-async def one_call(caller, callee, lip, eip, hold, stats, slot):
-    """Register two users, place a call, hold, BYE, close. Fully self-contained."""
-    # fresh WebSocket registration for both
-    ws_c, err_c = await register(caller)
-    ws_e, err_e = await register(callee)
-    if not ws_c or not ws_e:
-        for ws in (ws_c, ws_e):
-            if ws:
-                try: await ws.close()
-                except: pass
-        stats["reg_fail"] += 1
-        return
-
-    ext_c, pw_c, name_c = caller["ext"], caller["pw"], caller["name"]
-    ext_e, name_e       = callee["ext"], callee["name"]
-    port_c = 15000 + (slot * 2    ) % 25000
-    port_e = 15001 + (slot * 2 + 1) % 25000
-    cid    = uuid.uuid4().hex + "@" + DOMAIN
-    tag    = uuid.uuid4().hex[:8]
-    ok     = asyncio.Event()
-    sdp_c  = sdp(ext_c, lip, eip, port_c, "actpass")
-
-    def invite(cseq, br, extra=""):
-        sl = len(sdp_c.encode())
-        return (f"INVITE sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
-                f"Via: SIP/2.0/WSS {DOMAIN};rport;branch={br};alias\r\n"
-                f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
-                f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>\r\n"
-                f"Call-ID: {cid}\r\nCSeq: {cseq} INVITE\r\n"
-                f"Contact: <sip:{ext_c}@{DOMAIN};transport=ws>\r\n"
-                f"Max-Forwards: 70\r\n{extra}"
-                f"Content-Type: application/sdp\r\nContent-Length: {sl}\r\n\r\n{sdp_c}")
-
-    async def on_callee():
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws_e.recv(), timeout=45)
-                fl  = msg.splitlines()[0]
-                if fl.startswith("INVITE"):
-                    via_h  = "".join(f"Via: {v}\r\n" for v in vias(msg))
-                    cid_h  = re.search(r"Call-ID: ([^\r\n]+)", msg).group(1)
-                    from_h = re.search(r"From: ([^\r\n]+)", msg).group(1)
-                    to_h   = re.search(r"To: ([^\r\n]+)", msg).group(1)
-                    cseq_h = re.search(r"CSeq: ([^\r\n]+)", msg).group(1)
-                    t_tag  = uuid.uuid4().hex[:8]
-                    sdp_e  = sdp(ext_e, lip, eip, port_e, "active")
-                    await ws_e.send(
-                        f"SIP/2.0 200 OK\r\n{via_h}From: {from_h}\r\nTo: {to_h};tag={t_tag}\r\n"
-                        f"Call-ID: {cid_h}\r\nCSeq: {cseq_h}\r\n"
-                        f"Contact: <sip:{ext_e}@{DOMAIN};transport=ws>\r\n"
-                        f"Content-Type: application/sdp\r\nContent-Length: {len(sdp_e.encode())}\r\n\r\n{sdp_e}")
-                elif fl.startswith("ACK"):
-                    ok.set(); break
-                elif fl.startswith("CANCEL"):
-                    via_h  = "".join(f"Via: {v}\r\n" for v in vias(msg))
-                    cid_h  = re.search(r"Call-ID: ([^\r\n]+)", msg).group(1)
-                    from_h = re.search(r"From: ([^\r\n]+)", msg).group(1)
-                    to_h   = re.search(r"To: ([^\r\n]+)", msg).group(1)
-                    cseq_h = re.search(r"CSeq: ([^\r\n]+)", msg).group(1)
-                    await ws_e.send(
-                        f"SIP/2.0 200 OK\r\n{via_h}From: {from_h}\r\nTo: {to_h}\r\n"
-                        f"Call-ID: {cid_h}\r\nCSeq: {cseq_h}\r\nContent-Length: 0\r\n\r\n")
-                    break
-            except: break
-
-    async def on_caller():
-        br1 = "z9hG4bK" + uuid.uuid4().hex[:16]; cseq = 1
-        await ws_c.send(invite(cseq, br1))
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws_c.recv(), timeout=40)
-                fl  = msg.splitlines()[0]
-                if "407" in fl:
-                    chal = re.search(r"Proxy-Authenticate: (.+)", msg).group(1).strip()
-                    rlm  = re.search(r'realm="([^"]+)"', chal).group(1)
-                    nnc  = re.search(r'nonce="([^"]+)"', chal).group(1)
-                    uri2 = f"sip:{ext_e}@{DOMAIN}"
-                    pa   = (f'Digest username="{ext_c}", realm="{rlm}", nonce="{nnc}", uri="{uri2}", '
-                            f'response="{md5(md5(ext_c,rlm,pw_c),nnc,md5("INVITE",uri2))}", algorithm=MD5')
-                    await ws_c.send(
-                        f"ACK sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
-                        f"Via: SIP/2.0/WSS {DOMAIN};rport;branch={br1};alias\r\n"
-                        f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
-                        f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>\r\n"
-                        f"Call-ID: {cid}\r\nCSeq: {cseq} ACK\r\nContent-Length: 0\r\n\r\n")
-                    cseq += 1
-                    await ws_c.send(invite(cseq, "z9hG4bK"+uuid.uuid4().hex[:16], f"Proxy-Authorization: {pa}\r\n"))
-                elif "200" in fl and "OK" in fl:
-                    t_m = re.search(r"To: [^\r\n]+;tag=([^\r\n;]+)", msg)
-                    t_t = t_m.group(1) if t_m else ""
-                    await ws_c.send(
-                        f"ACK sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
-                        f"Via: SIP/2.0/WSS {DOMAIN};rport;branch=z9hG4bK{uuid.uuid4().hex[:16]};alias\r\n"
-                        f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
-                        f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>;tag={t_t}\r\n"
-                        f"Call-ID: {cid}\r\nCSeq: {cseq} ACK\r\nContent-Length: 0\r\n\r\n")
-                    ok.set(); break
-                elif any(c in fl for c in ["480","486","488","408","400","403","503","603"]):
-                    break
-            except: break
-
-    try:
-        await asyncio.gather(on_callee(), on_caller())
-    except: pass
-
-    if ok.is_set():
-        stats["connected"] += 1
-        await asyncio.sleep(hold)
-        try:
-            await ws_c.send(
-                f"BYE sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
-                f"Via: SIP/2.0/WSS {DOMAIN};rport;branch=z9hG4bK{uuid.uuid4().hex[:16]};alias\r\n"
-                f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
-                f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>\r\n"
-                f"Call-ID: {cid}\r\nCSeq: 10 BYE\r\nContent-Length: 0\r\n\r\n")
-        except: pass
-        stats["completed"] += 1
-    else:
-        stats["call_fail"] += 1
-
-    for ws in (ws_c, ws_e):
-        try: await ws.close()
-        except: pass
-
 # ── worker slot: runs calls back-to-back until STOP ───────────────────────────
 
-async def slot_worker(slot_id, users, lip, eip, hold, stats):
-    """One slot: pick a pair, call, when done pick next pair. Repeats until STOP."""
+async def slot_worker(slot_id, users, lip, eip, hold, stats, reg_sem):
+    """One slot: pick a pair, register with semaphore, call, when done pick next pair."""
+    # stagger startup: slot N waits N*0.1s so registrations don't all fire at once
+    await asyncio.sleep(slot_id * 0.1)
     n = len(users)
     idx = (slot_id * 2) % n  # start offset so slots don't all hit same pair
     while not STOP:
         caller = users[idx % n]
         callee = users[(idx + 1) % n]
         idx += 2
-        await one_call(caller, callee, lip, eip, hold, stats, slot_id)
+        # throttle registrations — max 20 concurrent across all slots
+        async with reg_sem:
+            ws_c, err_c = await register(caller)
+        async with reg_sem:
+            ws_e, err_e = await register(callee)
+
+        if not ws_c or not ws_e:
+            for ws in (ws_c, ws_e):
+                if ws:
+                    try: await ws.close()
+                    except: pass
+            stats["reg_fail"] += 1
+            await asyncio.sleep(5 + random.uniform(0, 5))  # backoff to avoid retry storm
+            continue
+
+        # run the call with pre-registered websockets
+        ext_c, pw_c, name_c = caller["ext"], caller["pw"], caller["name"]
+        ext_e, name_e       = callee["ext"], callee["name"]
+        port_c = 15000 + (slot_id * 2    ) % 25000
+        port_e = 15001 + (slot_id * 2 + 1) % 25000
+        cid    = uuid.uuid4().hex + "@" + DOMAIN
+        tag    = uuid.uuid4().hex[:8]
+        ok     = asyncio.Event()
+        sdp_c  = sdp(ext_c, lip, eip, port_c, "actpass")
+
+        def invite(cseq, br, extra=""):
+            sl = len(sdp_c.encode())
+            return (f"INVITE sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/WSS {DOMAIN};rport;branch={br};alias\r\n"
+                    f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
+                    f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>\r\n"
+                    f"Call-ID: {cid}\r\nCSeq: {cseq} INVITE\r\n"
+                    f"Contact: <sip:{ext_c}@{DOMAIN};transport=ws>\r\n"
+                    f"Max-Forwards: 70\r\n{extra}"
+                    f"Content-Type: application/sdp\r\nContent-Length: {sl}\r\n\r\n{sdp_c}")
+
+        async def on_callee():
+            while True:
+                try:
+                    msg = await asyncio.wait_for(ws_e.recv(), timeout=45)
+                    fl  = msg.splitlines()[0]
+                    if fl.startswith("INVITE"):
+                        via_h  = "".join(f"Via: {v}\r\n" for v in vias(msg))
+                        cid_h  = re.search(r"Call-ID: ([^\r\n]+)", msg).group(1)
+                        from_h = re.search(r"From: ([^\r\n]+)", msg).group(1)
+                        to_h   = re.search(r"To: ([^\r\n]+)", msg).group(1)
+                        cseq_h = re.search(r"CSeq: ([^\r\n]+)", msg).group(1)
+                        t_tag  = uuid.uuid4().hex[:8]
+                        sdp_e  = sdp(ext_e, lip, eip, port_e, "active")
+                        await ws_e.send(
+                            f"SIP/2.0 200 OK\r\n{via_h}From: {from_h}\r\nTo: {to_h};tag={t_tag}\r\n"
+                            f"Call-ID: {cid_h}\r\nCSeq: {cseq_h}\r\n"
+                            f"Contact: <sip:{ext_e}@{DOMAIN};transport=ws>\r\n"
+                            f"Content-Type: application/sdp\r\nContent-Length: {len(sdp_e.encode())}\r\n\r\n{sdp_e}")
+                    elif fl.startswith("ACK"):
+                        ok.set(); break
+                    elif fl.startswith("CANCEL"):
+                        via_h  = "".join(f"Via: {v}\r\n" for v in vias(msg))
+                        cid_h  = re.search(r"Call-ID: ([^\r\n]+)", msg).group(1)
+                        from_h = re.search(r"From: ([^\r\n]+)", msg).group(1)
+                        to_h   = re.search(r"To: ([^\r\n]+)", msg).group(1)
+                        cseq_h = re.search(r"CSeq: ([^\r\n]+)", msg).group(1)
+                        await ws_e.send(
+                            f"SIP/2.0 200 OK\r\n{via_h}From: {from_h}\r\nTo: {to_h}\r\n"
+                            f"Call-ID: {cid_h}\r\nCSeq: {cseq_h}\r\nContent-Length: 0\r\n\r\n")
+                        break
+                except: break
+
+        async def on_caller():
+            br1 = "z9hG4bK" + uuid.uuid4().hex[:16]; cseq = 1
+            await ws_c.send(invite(cseq, br1))
+            while True:
+                try:
+                    msg = await asyncio.wait_for(ws_c.recv(), timeout=40)
+                    fl  = msg.splitlines()[0]
+                    if "407" in fl:
+                        chal = re.search(r"Proxy-Authenticate: (.+)", msg).group(1).strip()
+                        rlm  = re.search(r'realm="([^"]+)"', chal).group(1)
+                        nnc  = re.search(r'nonce="([^"]+)"', chal).group(1)
+                        uri2 = f"sip:{ext_e}@{DOMAIN}"
+                        pa   = (f'Digest username="{ext_c}", realm="{rlm}", nonce="{nnc}", uri="{uri2}", '
+                                f'response="{md5(md5(ext_c,rlm,pw_c),nnc,md5("INVITE",uri2))}", algorithm=MD5')
+                        await ws_c.send(
+                            f"ACK sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/WSS {DOMAIN};rport;branch={br1};alias\r\n"
+                            f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
+                            f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>\r\n"
+                            f"Call-ID: {cid}\r\nCSeq: {cseq} ACK\r\nContent-Length: 0\r\n\r\n")
+                        cseq += 1
+                        await ws_c.send(invite(cseq, "z9hG4bK"+uuid.uuid4().hex[:16], f"Proxy-Authorization: {pa}\r\n"))
+                    elif "200" in fl and "OK" in fl:
+                        t_m = re.search(r"To: [^\r\n]+;tag=([^\r\n;]+)", msg)
+                        t_t = t_m.group(1) if t_m else ""
+                        await ws_c.send(
+                            f"ACK sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
+                            f"Via: SIP/2.0/WSS {DOMAIN};rport;branch=z9hG4bK{uuid.uuid4().hex[:16]};alias\r\n"
+                            f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
+                            f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>;tag={t_t}\r\n"
+                            f"Call-ID: {cid}\r\nCSeq: {cseq} ACK\r\nContent-Length: 0\r\n\r\n")
+                        ok.set(); break
+                    elif any(c in fl for c in ["480","486","488","408","400","403","503","603"]):
+                        break
+                except: break
+
+        try:
+            await asyncio.gather(on_callee(), on_caller())
+        except: pass
+
+        if ok.is_set():
+            stats["connected"] += 1
+            await asyncio.sleep(hold)
+            try:
+                await ws_c.send(
+                    f"BYE sip:{ext_e}@{DOMAIN} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/WSS {DOMAIN};rport;branch=z9hG4bK{uuid.uuid4().hex[:16]};alias\r\n"
+                    f"From: \"{name_c}\" <sip:{ext_c}@{DOMAIN}>;tag={tag}\r\n"
+                    f"To: \"{name_e}\" <sip:{ext_e}@{DOMAIN}>\r\n"
+                    f"Call-ID: {cid}\r\nCSeq: 10 BYE\r\nContent-Length: 0\r\n\r\n")
+            except: pass
+            stats["completed"] += 1
+        else:
+            stats["call_fail"] += 1
+            await asyncio.sleep(2 + random.uniform(0, 3))  # brief backoff on call fail
+
+        for ws in (ws_c, ws_e):
+            try: await ws.close()
+            except: pass
 
 # ── stats printer ─────────────────────────────────────────────────────────────
 
@@ -395,7 +397,8 @@ async def main(target, hold, suffix_start, pool_size, cred_workers):
     print(f"\n[3/3] Starting {target} call slots...\n", flush=True)
     stats = {"connected": 0, "completed": 0, "reg_fail": 0, "call_fail": 0}
 
-    tasks = [asyncio.create_task(slot_worker(i, users, lip, eip, hold, stats))
+    reg_sem = asyncio.Semaphore(30)  # max 30 concurrent SIP registrations
+    tasks = [asyncio.create_task(slot_worker(i, users, lip, eip, hold, stats, reg_sem))
              for i in range(target)]
     tasks.append(asyncio.create_task(print_stats(stats, target, t0)))
 

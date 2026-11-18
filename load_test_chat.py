@@ -11,11 +11,13 @@ Usage:
   python3 load_test_chat.py --mode login   --workers 20 --duration 60
   python3 load_test_chat.py --mode mixed   --workers 100 --duration 180
 """
-import asyncio, aiohttp, argparse, json, uuid, time, random, signal, sys
+import asyncio, aiohttp, argparse, json, uuid, time, random, signal, sys, os
 
-BASE = 'https://portal.qa.unifiedrtc.com/api/v1'
+BASE       = 'https://portal.qa.unifiedrtc.com/api/v1'
 ADMIN_EMAIL = 'shreyanshdubey1122@gmail.com'
 ADMIN_PASS  = 'Aadmin@123456!'
+TOKEN_CACHE = '/tmp/chat_lt_tokens.json'
+TOKEN_TTL   = 3000  # seconds — JWT lives ~3600s, refresh before expiry
 PRIORITIES  = ['LOW', 'NORMAL', 'HIGH', 'URGENT']
 STATUSES    = ['OPEN', 'IN_PROGRESS', 'CLOSED']
 
@@ -157,11 +159,33 @@ async def login_worker(worker_id, session, stats, suffix_start):
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
 # ---------------------------------------------------------------------------
-# Token pool: login with N accounts up front
+# Token pool: login with N accounts, disk-cached to survive rate limits
 # ---------------------------------------------------------------------------
+def load_cached_tokens():
+    try:
+        with open(TOKEN_CACHE) as f:
+            data = json.load(f)
+        if time.time() - data['ts'] < TOKEN_TTL:
+            return data['tokens']
+    except Exception:
+        pass
+    return []
+
+def save_cached_tokens(tokens):
+    with open(TOKEN_CACHE, 'w') as f:
+        json.dump({'ts': time.time(), 'tokens': tokens}, f)
+
 async def build_token_pool(session, n_tokens, suffix_start, stats):
-    sem = asyncio.Semaphore(5)
-    tokens = []
+    cached = load_cached_tokens()
+    if len(cached) >= n_tokens:
+        print(f'[+] Using {n_tokens} cached tokens (skipping login)')
+        stats.login_ok += n_tokens
+        return cached[:n_tokens]
+
+    print(f'[+] Cache has {len(cached)}/{n_tokens} tokens — fetching {n_tokens - len(cached)} more...')
+    sem = asyncio.Semaphore(2)  # stay under 5-req/68s rate limit
+    tokens = list(cached)
+    start_i = len(cached)
 
     async def fetch_one(i):
         async with sem:
@@ -171,9 +195,11 @@ async def build_token_pool(session, n_tokens, suffix_start, stats):
             if tok:
                 tokens.append(tok)
                 stats.login_ok += 1
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.5)
 
-    await asyncio.gather(*[fetch_one(i) for i in range(n_tokens)])
+    await asyncio.gather(*[fetch_one(start_i + i) for i in range(n_tokens - start_i)])
+    if tokens:
+        save_cached_tokens(tokens)
     return tokens
 
 # ---------------------------------------------------------------------------
