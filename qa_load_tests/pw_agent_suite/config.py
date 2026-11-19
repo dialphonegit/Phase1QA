@@ -16,7 +16,8 @@ DID_NUMBER       = os.getenv("DID_NUMBER",       "+1 201 778 2309")
 
 # Browser
 HEADLESS         = os.getenv("HEADLESS",         "false").lower() == "true"
-MAX_WORKERS      = int(os.getenv("MAX_WORKERS",  "10"))   # concurrent Playwright contexts
+MAX_WORKERS      = int(os.getenv("MAX_WORKERS",  "10"))   # concurrent agent STARTUPS (launch throttle)
+CONTEXTS_PER_BROWSER = int(os.getenv("CONTEXTS_PER_BROWSER", "25"))  # contexts per Chromium shard
 BROWSER_TIMEOUT  = int(os.getenv("BROWSER_TIMEOUT", "30000"))  # ms per action
 
 # Call behaviour

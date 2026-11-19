@@ -2,11 +2,13 @@
 from __future__ import annotations
 import asyncio
 import logging
+import math
 from typing import Callable, Awaitable
 from playwright.async_api import async_playwright, Browser
-from config import HEADLESS, MAX_WORKERS, NUM_AGENTS, HOLD_SECONDS
+from config import MAX_WORKERS, NUM_AGENTS, HOLD_SECONDS, CONTEXTS_PER_BROWSER
 from agent_session import AgentSession
 from ramp_controller import RampController
+import config
 import db
 
 log = logging.getLogger(__name__)
@@ -34,6 +36,8 @@ class AgentRunner:
         self._pw          = None
         self._browser: Browser = None           # headless pool (or the single browser)
         self._browser_headed: Browser = None     # visible browser for headed agents
+        self._headless_pool: list[Browser] = []  # headless Chromium shards
+        self._browsers:      list[Browser] = []  # all launched browsers (for cleanup)
         self._running     = False
         self._tasks:      list[asyncio.Task] = []
 
@@ -49,24 +53,38 @@ class AgentRunner:
                        "--disable-web-security"]
 
         self._pw = await async_playwright().start()
-        if self.headed_count > 0:
-            # Mixed mode: a visible browser for the first `headed_count` agents,
-            # a headless browser for the rest. (Headless/headed can't be mixed
-            # within one Chromium process, so we launch two.)
+
+        n_total    = len(self.creds)
+        n_headed   = self.headed_count
+        n_headless = n_total - n_headed
+
+        # Visible browser for the first `headed_count` agents.
+        if n_headed > 0:
             self._browser_headed = await self._pw.chromium.launch(
                 headless=False, args=launch_args)
-            if self.headed_count < len(self.creds):
-                self._browser = await self._pw.chromium.launch(
-                    headless=True, args=launch_args)
-            log.info("Mixed mode | %d headed + %d headless | %d agents | ramp=%s",
-                     self.headed_count, len(self.creds) - self.headed_count,
-                     len(self.creds), self.ramp_profile)
-        else:
-            self._browser = await self._pw.chromium.launch(
-                headless=HEADLESS, args=launch_args)
-            log.info("Browser up | headless=%s | %d agents | ramp=%s",
-                     HEADLESS, len(self.creds), self.ramp_profile)
+            self._browsers.append(self._browser_headed)
+
+        # Shard the remaining agents across several Chromium processes. One
+        # process hosting ~100 contexts saturates and goes unresponsive (dropped
+        # rings / missed calls); CONTEXTS_PER_BROWSER contexts per shard keeps
+        # each process healthy. When headed_count==0 the pool honours the per-run
+        # config.HEADLESS flag (so an all-headed run is still sharded).
+        if n_headless > 0:
+            pool_headless = True if n_headed > 0 else config.HEADLESS
+            shards = max(1, math.ceil(n_headless / CONTEXTS_PER_BROWSER))
+            for _ in range(shards):
+                br = await self._pw.chromium.launch(
+                    headless=pool_headless, args=launch_args)
+                self._headless_pool.append(br)
+                self._browsers.append(br)
+            self._browser = self._headless_pool[0]   # handle for the watchdog
+        elif self._browser_headed:
+            self._browser = self._browser_headed
+
         self._running = True
+        log.info("Browsers up | %d headed + %d across %d shard(s) | %d agents | ramp=%s",
+                 n_headed, n_headless, len(self._headless_pool), n_total,
+                 self.ramp_profile)
 
         sem = asyncio.Semaphore(self.max_workers)
         ramp = RampController(
@@ -74,20 +92,30 @@ class AgentRunner:
             broadcast=self.broadcast
         )
 
+        def _browser_for(i):
+            # First `headed_count` agents → visible browser; rest → round-robin
+            # across the headless shard pool.
+            if n_headed > 0 and i < n_headed:
+                return self._browser_headed
+            return self._headless_pool[(i - n_headed) % len(self._headless_pool)]
+
         for i, cred in enumerate(self.creds):
-            # First `headed_count` agents → visible browser; the rest → headless.
-            browser = (self._browser_headed
-                       if (self.headed_count > 0 and i < self.headed_count)
-                       else self._browser)
-            sess = AgentSession(cred, browser, self._on_event, self.hold)
+            sess = AgentSession(cred, _browser_for(i), self._on_event, self.hold)
             self.sessions[cred["extension"]] = sess
 
         delays = ramp.delays()
         async def _launch(cred, delay):
             if delay > 0:
                 await asyncio.sleep(delay)
+            sess = self.sessions[cred["extension"]]
+            # Throttle only the heavy bring-online phase (login + SIP register +
+            # queue join). Releasing the permit before the call loop means ALL
+            # agents answer concurrently — max_workers caps launch rate, not the
+            # number of live agents.
             async with sem:
-                await self.sessions[cred["extension"]].start()
+                online = await sess.start()
+            if online:
+                await sess.run()
 
         self._tasks = [
             asyncio.create_task(_launch(c, d))
@@ -101,12 +129,11 @@ class AgentRunner:
             await s.stop()
         for t in self._tasks:
             t.cancel()
-        for br in (self._browser, self._browser_headed):
-            if br:
-                try:
-                    await br.close()
-                except Exception:
-                    pass
+        for br in self._browsers:
+            try:
+                await br.close()
+            except Exception:
+                pass
         if self._pw:
             await self._pw.stop()
         log.info("Runner stopped.")
