@@ -37,6 +37,7 @@ app = FastAPI(title="PW Agent Suite v3", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 _clients:  Set[WebSocket] = set()
+_fetch_running: bool = False
 _runner:   AgentRunner | None = None
 _callers:  CallerRunner | None = None
 _guard:    SessionGuard | None = None
@@ -353,13 +354,25 @@ class FetchConfig(BaseModel):
 
 @app.post("/api/fetch-creds")
 async def api_fetch(cfg: FetchConfig):
+    global _fetch_running
+    if _fetch_running:
+        return JSONResponse({"error": "fetch already running"}, 409)
     emails = creds_mod.member_emails(cfg.start, cfg.end)
-    async def _progress(done, total, email, ok):
-        await broadcast({"type": "fetch_progress", "done": done, "total": total,
-                         "email": email, "ok": ok,
-                         "eta_min": round((total-done)*14/60,1)})
-    asyncio.create_task(creds_mod.fetch(emails, out_path=CREDS_FILE, progress_cb=_progress))
-    return {"ok": True, "total": len(emails), "eta_min": round(len(emails)*14/60,1)}
+    async def _run():
+        global _fetch_running
+        _fetch_running = True
+        try:
+            async def _progress(done, total, email, ok):
+                await broadcast({"type": "fetch_progress", "done": done, "total": total,
+                                 "email": email, "ok": ok,
+                                 "eta_min": round((total-done)*2/60,1)})
+            await creds_mod.fetch(emails, out_path=CREDS_FILE, progress_cb=_progress)
+            await broadcast({"type": "fetch_progress", "done": len(emails),
+                             "total": len(emails), "email": "", "ok": True, "eta_min": 0})
+        finally:
+            _fetch_running = False
+    asyncio.create_task(_run())
+    return {"ok": True, "total": len(emails), "eta_min": round(len(emails)*2/60,1)}
 
 
 if __name__ == "__main__":

@@ -26,10 +26,10 @@ from config import PORTAL_URL, AGENT_WEB_PASS
 log = logging.getLogger(__name__)
 
 _LOGIN_URL = f"{PORTAL_URL}/api/v1/auth/login"
-# Authoritative email -> extension/password mapping (ext 1000-9999, shared pw).
-_MEMBERS_FILE = "/home/crown/Downloads/members-credentials.json"
-# Legacy browser-login pacing (unused by the API path, kept for the fallback).
-_LOGIN_INTERVAL = 14.0
+# Optional local members file (not required — extension derived from email index if absent).
+_MEMBERS_FILE = ""
+# Gap between API logins to avoid rate-limiting.
+_LOGIN_INTERVAL = 2.0
 
 
 def load(path: str) -> list[dict]:
@@ -112,15 +112,16 @@ async def _login_one_browser(browser, email: str, password: str) -> dict | None:
 
 
 def _ext_map() -> dict:
-    """email -> (extension, password) from the authoritative members file."""
+    """email -> (extension, password) from the optional members file."""
+    if not _MEMBERS_FILE:
+        return {}
     try:
         data = json.loads(Path(_MEMBERS_FILE).read_text())
         rows = data if isinstance(data, list) else (
             data.get("members") or data.get("creds") or [])
         return {r["email"]: (str(r.get("extension", "")), r.get("password", ""))
                 for r in rows if r.get("email")}
-    except Exception as e:
-        log.warning("Could not read members file %s: %s", _MEMBERS_FILE, e)
+    except Exception:
         return {}
 
 
@@ -210,6 +211,8 @@ async def fetch(
                 await progress_cb(i + 1, len(emails), email, bool(cred))
             if i % 5 == 0:
                 _save()
+            if i < len(emails) - 1:
+                await asyncio.sleep(_LOGIN_INTERVAL)
 
     _save()
     if out_path:
