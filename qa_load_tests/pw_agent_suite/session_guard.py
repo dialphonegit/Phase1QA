@@ -52,11 +52,13 @@ class SessionGuard:
         await sess.stop()
         await asyncio.sleep(2 * count)   # back-off
         from agent_session import AgentSession
-        new = AgentSession(sess.cred, self.runner._browser,
+        # Reuse the same browser the dead session used (headed or headless pool).
+        browser = getattr(sess, "browser", None) or self.runner._browser
+        new = AgentSession(sess.cred, browser,
                            self.runner._on_event, self.runner.hold)
         self.runner.sessions[ext] = new
         self._last_ok[ext] = time.time()
-        asyncio.create_task(new.start())
+        asyncio.create_task(new.run_lifecycle())
         if self.broadcast:
             await self.broadcast({"type": "agent_restarted", "ext": ext, "attempt": count})
 

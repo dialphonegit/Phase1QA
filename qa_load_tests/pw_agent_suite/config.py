@@ -16,7 +16,8 @@ DID_NUMBER       = os.getenv("DID_NUMBER",       "+1 201 778 2309")
 
 # Browser
 HEADLESS         = os.getenv("HEADLESS",         "false").lower() == "true"
-MAX_WORKERS      = int(os.getenv("MAX_WORKERS",  "10"))   # concurrent Playwright contexts
+MAX_WORKERS      = int(os.getenv("MAX_WORKERS",  "10"))   # concurrent agent STARTUPS (launch throttle)
+CONTEXTS_PER_BROWSER = int(os.getenv("CONTEXTS_PER_BROWSER", "25"))  # contexts per Chromium shard
 BROWSER_TIMEOUT  = int(os.getenv("BROWSER_TIMEOUT", "30000"))  # ms per action
 
 # Call behaviour
@@ -47,6 +48,17 @@ SEL = {
 
     # After clicking status_btn a popover opens; "Active ✓" = queue calls on
     "online_opt":   '[data-slot="popover-content"] button:has-text("Active")',
+
+    # Per-queue availability — the "Campaigns & queues" headset icon opens a panel
+    # with a "Assigned Queues" tab; each queue row has a toggle button that reads
+    # "Make Available" when the agent is currently UNavailable in that queue, and
+    # "Make Unavailable" when already available. (:text-is = exact, so "Make
+    # Available" never matches the "Make Unavailable" label.)
+    "queues_panel_btn":     'button[aria-label="Campaigns & queues"]',
+    "assigned_tab":         '[data-slot="tabs-trigger"]:has-text("Assigned Queues"), '
+                            '[role="tab"]:has-text("Assigned Queues")',
+    "make_available_btn":   'button:text-is("Make Available")',
+    "make_unavailable_btn": 'button:text-is("Make Unavailable")',
 
     # Incoming call widget — portal shows a Toastify toast or fixed overlay.
     # The toast container is always present; actual ringing call appears as a child.

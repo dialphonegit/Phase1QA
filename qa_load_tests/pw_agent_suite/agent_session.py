@@ -37,30 +37,57 @@ class AgentSession:
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
-    async def start(self):
-        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-        self.ctx = await self.browser.new_context(
-            ignore_https_errors=True,
-            permissions=["microphone", "camera"],
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        self.ctx.set_default_timeout(BROWSER_TIMEOUT)
-        self.page = await self.ctx.new_page()
-        self._running = True
+    async def start(self) -> bool:
+        """Bring the agent ONLINE (context → login → go online → join queues).
 
+        Returns True once the agent is online and available. Does NOT run the
+        call loop — the caller runs run() separately. This split lets the runner
+        throttle only the heavy startup phase with a semaphore, instead of
+        holding a concurrency permit for the agent's entire lifetime (which
+        previously capped the number of *running* agents at max_workers).
+        """
+        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
         try:
+            self.ctx = await self.browser.new_context(
+                ignore_https_errors=True,
+                permissions=["microphone", "camera"],
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            self.ctx.set_default_timeout(BROWSER_TIMEOUT)
+            self.page = await self.ctx.new_page()
+            self._running = True
+
             await self._login()
             await self._go_online()
+            await self._set_queue_availability()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("[%s] startup failed: %s", self.ext, e)
+            try: await self._screenshot("error")
+            except Exception: pass
+            await self._emit("error", {"message": str(e)})
+            await self._cleanup()
+            return False
+
+    async def run(self):
+        """Answer calls until stopped. Runs unthrottled (no concurrency permit)."""
+        try:
             await self._call_loop()
         except asyncio.CancelledError:
             pass
         except Exception as e:
             log.error("[%s] fatal: %s", self.ext, e)
-            await self._screenshot("error")
             await self._emit("error", {"message": str(e)})
         finally:
             await self._cleanup()
+
+    async def run_lifecycle(self):
+        """Convenience: bring online, then serve calls (used by the watchdog)."""
+        if await self.start():
+            await self.run()
 
     async def stop(self):
         self._running = False
@@ -152,6 +179,131 @@ class AgentSession:
                 pass
         await self._emit("online", {"status": self.status})
 
+    async def _resume_available(self):
+        """Clear the post-call "Wrap-up" state and return the agent to Active.
+
+        After a call the portal shows "Wrap-up Ns / Queue calls off" and stops
+        delivering queue calls until the agent is Available again. Fast path: a
+        dedicated "Available"/"Ready"/"End wrap-up" button if the portal shows
+        one; otherwise re-open the status pill and pick "Active".
+        """
+        try:
+            # Fast path — an explicit resume button during wrap-up.
+            # Exact-text (text-is) so "Available" can NOT match the queue panel's
+            # "Make Available" / "Make Unavailable" toggles.
+            for sel in ('button:text-is("Available")',
+                        'button:text-is("Ready")',
+                        'button:text-is("End wrap-up")',
+                        'button:text-is("End Wrap-up")'):
+                try:
+                    btn = await self.page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(0.4)
+                        self.status = "idle"
+                        await self._emit("resumed", {"via": "button"})
+                        return
+                except Exception:
+                    pass
+            # Fallback — re-assert Active via the status popover.
+            await self._go_online()
+            await self._emit("resumed", {"via": "status"})
+        except Exception as e:
+            log.warning("[%s] resume-available failed: %s", self.ext, e)
+
+    # ── per-queue availability ───────────────────────────────────────────────────
+
+    async def _set_queue_availability(self) -> int:
+        """Make this agent AVAILABLE in every assigned queue.
+
+        The portal gates queue calls per-queue: the "Campaigns & queues" panel's
+        "Assigned Queues" tab lists each queue with a toggle that reads
+        "Make Available" when the agent is currently unavailable there. This
+        opens that panel and clicks every "Make Available" button, so the agent
+        becomes available in all its assigned queues. Idempotent — queues already
+        available (button reads "Make Unavailable") are left untouched.
+
+        Returns the number of assigned queues the agent is available in afterwards.
+        """
+        try:
+            await self.page.wait_for_selector(SEL["queues_panel_btn"], timeout=8000)
+
+            # Opening the panel is a toggle, so confirm it actually opened (the
+            # "Assigned Queues" tab becomes visible) and re-click if a prior open
+            # state meant our click closed it instead.
+            opened = False
+            for _ in range(3):
+                # Clear any modal/onboarding overlay that would intercept the
+                # click (Playwright otherwise blocks and times out for 30s).
+                await self._dismiss_modals()
+                try:
+                    # Short timeout + force so a transient overlay can't hang us.
+                    await self.page.click(SEL["queues_panel_btn"], timeout=5000)
+                except Exception:
+                    try:
+                        await self.page.click(SEL["queues_panel_btn"],
+                                              timeout=3000, force=True)
+                    except Exception:
+                        continue
+                await asyncio.sleep(0.8)
+                try:
+                    tab = await self.page.wait_for_selector(
+                        SEL["assigned_tab"], timeout=3000, state="visible")
+                    opened = True
+                    break
+                except Exception:
+                    continue
+            if not opened:
+                log.warning("[%s] could not open Campaigns & queues panel", self.ext)
+                return 0
+
+            # Select the "Assigned Queues" tab (best-effort; may already be active)
+            try:
+                await tab.click()
+                await asyncio.sleep(0.8)
+            except Exception:
+                pass
+
+            # Click every "Make Available" button. The list re-renders after each
+            # click (button flips to "Make Unavailable"), so re-query in a few passes.
+            made = 0
+            for _ in range(4):
+                btns = await self.page.query_selector_all(SEL["make_available_btn"])
+                if not btns:
+                    break
+                progressed = False
+                for b in btns:
+                    try:
+                        if await b.is_visible():
+                            await b.click()
+                            made += 1
+                            progressed = True
+                            await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+                if not progressed:
+                    break
+
+            available_now = len(await self.page.query_selector_all(
+                SEL["make_unavailable_btn"]))
+            self._queues_available = available_now
+            await self._screenshot("queues")
+            await self._emit("queues_available", {
+                "made_available": made, "available_total": available_now})
+            log.info("[%s] queues: made %d available, now available in %d",
+                     self.ext, made, available_now)
+
+            # Close the panel so it doesn't overlay later call widgets.
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return available_now
+        except Exception as e:
+            log.warning("[%s] set-queue-availability failed: %s", self.ext, e)
+            return 0
+
     # ── call loop ──────────────────────────────────────────────────────────────
 
     async def _call_loop(self):
@@ -194,6 +346,12 @@ class AgentSession:
                     "end_at": end_at, "duration": int(end_at - answer_at),
                 })
 
+                # After a call the portal drops the agent into "Wrap-up"
+                # (after-call-work) where the pill shows "Queue calls off" and
+                # NO new queue calls are delivered. Clear wrap-up / re-assert
+                # Active so the agent keeps answering subsequent queue calls.
+                await self._resume_available()
+
             except asyncio.CancelledError:
                 raise
             except PWError as e:
@@ -217,18 +375,19 @@ class AgentSession:
         # Primary selectors (order: most specific → broadest fallback)
         primary_sels = SEL["incoming"].split(", ")
 
-        # Broad fallbacks: any new button with answer/accept text
+        # Fallbacks — only selectors that genuinely denote an INCOMING CALL.
+        # (The old broad set — '.Toastify__toast button', '[class*="ring"]',
+        # '[class*="call"][class*="widget"]' — matched ordinary toasts, charts
+        # like "Call Distribution" and any class containing "ring"/"call",
+        # producing phantom rings that then held the agent off real calls.)
         broad_sels = [
-            'button:has-text("Answer")',
-            'button:has-text("Accept")',
-            '[aria-label*="Answer" i]',
-            '[aria-label*="Incoming" i]',
-            # Toastify toast that contains a phone action
-            '.Toastify__toast button',
-            # Any fixed-position overlay with a call action
-            '[class*="call"][class*="widget"]',
-            '[class*="call"][class*="panel"]',
-            '[class*="ring"]',
+            '.Toastify__toast:has(button[aria-label*="nswer" i])',
+            '.Toastify__toast:has(button:has-text("Answer"))',
+            '.Toastify__toast:has(button:has-text("Accept"))',
+            'button[aria-label*="Answer" i]',
+            '[aria-label*="Incoming call" i]',
+            '[class*="incoming-call" i]',
+            '[data-testid="answer-btn"]',
         ]
 
         all_sels = primary_sels + broad_sels
@@ -248,31 +407,64 @@ class AgentSession:
         return False
 
     async def _answer_call(self) -> bool:
-        """Click the answer button using multiple fallback strategies."""
+        """Click the answer button and VERIFY the call actually connected.
+
+        Returns True only if an in-call control (End/Hang up) appears afterwards.
+        This prevents false positives: previously any click — or the Enter
+        fallback, which always "succeeded" — marked the call answered, so the
+        agent then slept `hold` seconds on a phantom call and missed real ones.
+        """
         answer_sels = [
             'button[aria-label*="Answer" i]',
-            'button:has-text("Answer")',
-            'button:has-text("Accept")',
             '.Toastify__toast button:has-text("Answer")',
             '.Toastify__toast button:has-text("Accept")',
             '[data-testid="answer-btn"]',
+            'button:has-text("Answer")',
+            'button:has-text("Accept")',
         ]
+        clicked = False
         for sel in answer_sels:
             try:
-                btn = await self.page.wait_for_selector(sel, timeout=3000)
-                if btn:
-                    await btn.click()
-                    return True
+                btn = await self.page.query_selector(sel)
+                if btn and await btn.is_visible():
+                    await btn.click(timeout=3000)
+                    clicked = True
+                    break
             except Exception:
                 pass
+        if not clicked:
+            return False
 
-        # Last resort: keyboard shortcut (some portals support Enter to answer)
+        # Confirm we're genuinely on a call: a hangup/End control should appear.
+        hangup_sels = SEL["hangup"].split(", ")
+        for _ in range(15):          # up to ~3s for the in-call UI to render
+            for hs in hangup_sels:
+                try:
+                    h = await self.page.query_selector(hs)
+                    if h and await h.is_visible():
+                        return True
+                except Exception:
+                    pass
+            await asyncio.sleep(0.2)
+        return False   # clicked but never reached an in-call state → not answered
+
+    async def end_call(self) -> bool:
+        """Force-hang up this agent's current call immediately.
+
+        Used by the dashboard "End all calls" button. Best-effort: clicks the
+        hangup control now; the running call loop's own post-hold hangup then
+        becomes a harmless no-op. Does NOT stop the agent — it stays online and
+        available for the next queue call.
+        """
         try:
-            await self.page.keyboard.press("Enter")
+            await self._hangup()
+            self.status = "idle"
+            await self._emit("call_ended", {"forced": True,
+                                            "end_at": time.time()})
             return True
-        except Exception:
-            pass
-        return False
+        except Exception as e:
+            log.warning("[%s] end_call failed: %s", self.ext, e)
+            return False
 
     async def _hangup(self):
         """Hang up the call using multiple fallback strategies."""
