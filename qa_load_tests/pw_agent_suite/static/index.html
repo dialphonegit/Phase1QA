@@ -77,7 +77,7 @@ body.tv-mode #tv-panel{display:grid!important}
     <button onclick="openSettings()" class="px-3 py-1.5 text-xs bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700">⚙ Settings</button>
     <button onclick="startE2E()" class="px-3 py-1.5 text-xs bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 rounded-lg font-semibold shadow">⚡ E2E</button>
     <button id="btn-start" onclick="startRunner()" class="px-4 py-1.5 text-xs bg-green-600 hover:bg-green-500 rounded-lg font-semibold">▶ Start</button>
-    <button id="btn-end-calls" onclick="endAllCalls()" class="px-4 py-1.5 text-xs bg-orange-600 hover:bg-orange-500 rounded-lg font-semibold">☎ End All Calls</button>
+    <button id="btn-end-calls" onclick="endAllCalls()" class="px-4 py-1.5 text-xs bg-orange-600 hover:bg-orange-500 rounded-lg font-semibold hidden">☎ End All Calls</button>
     <button id="btn-stop"  onclick="stopAll()"    class="px-4 py-1.5 text-xs bg-red-700 hover:bg-red-600 rounded-lg font-semibold hidden">⏹ Stop All</button>
     <button onclick="toggleTV()" class="px-2.5 py-1.5 text-xs bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700" title="TV Wall Mode">📺</button>
   </div>
@@ -343,6 +343,7 @@ body.tv-mode #tv-panel{display:grid!important}
         <div class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">Options</div>
         <div class="space-y-2.5">
           <label class="flex items-center gap-2 cursor-pointer"><input id="cfg-headless" type="checkbox" class="rounded"><span class="text-sm">Headless mode</span></label>
+          <label class="flex items-center gap-2"><input id="cfg-headed-count" type="number" value="0" min="0" max="200" class="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm"><span class="text-sm">Visible (headed) agents — rest headless</span></label>
           <label class="flex items-center gap-2 cursor-pointer"><input id="cfg-setfwd"   type="checkbox" class="rounded"><span class="text-sm">Set DID call forwarding on start</span></label>
           <label class="flex items-center gap-2 cursor-pointer"><input id="cfg-guard"    type="checkbox" checked class="rounded"><span class="text-sm">Session watchdog (auto-restart dead agents)</span></label>
           <label class="flex items-center gap-2 cursor-pointer"><input id="cfg-alerts-en" type="checkbox" checked class="rounded"><span class="text-sm">Alert engine</span></label>

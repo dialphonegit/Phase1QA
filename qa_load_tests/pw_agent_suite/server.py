@@ -105,6 +105,7 @@ class StartConfig(BaseModel):
     enable_alerts:  bool  = True
     ramp_profile:   str   = "instant"
     ramp_duration:  int   = 60
+    headed_count:   int   = 0     # run this many agents in a visible browser, rest headless
 
 @app.post("/api/start")
 async def api_start(cfg: StartConfig):
@@ -125,7 +126,7 @@ async def api_start(cfg: StartConfig):
 
     _runner = AgentRunner(cred_list, cfg.hold_seconds, cfg.max_workers, broadcast,
                           cfg.ramp_profile, cfg.ramp_duration,
-                          num_agents=cfg.num_agents)
+                          num_agents=cfg.num_agents, headed_count=cfg.headed_count)
     _bg_tasks.append(asyncio.create_task(_runner.start()))
     _start_ts = time.time()
 

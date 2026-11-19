@@ -153,6 +153,38 @@ class AgentSession:
                 pass
         await self._emit("online", {"status": self.status})
 
+    async def _resume_available(self):
+        """Clear the post-call "Wrap-up" state and return the agent to Active.
+
+        After a call the portal shows "Wrap-up Ns / Queue calls off" and stops
+        delivering queue calls until the agent is Available again. Fast path: a
+        dedicated "Available"/"Ready"/"End wrap-up" button if the portal shows
+        one; otherwise re-open the status pill and pick "Active".
+        """
+        try:
+            # Fast path — an explicit resume button during wrap-up.
+            # Exact-text (text-is) so "Available" can NOT match the queue panel's
+            # "Make Available" / "Make Unavailable" toggles.
+            for sel in ('button:text-is("Available")',
+                        'button:text-is("Ready")',
+                        'button:text-is("End wrap-up")',
+                        'button:text-is("End Wrap-up")'):
+                try:
+                    btn = await self.page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(0.4)
+                        self.status = "idle"
+                        await self._emit("resumed", {"via": "button"})
+                        return
+                except Exception:
+                    pass
+            # Fallback — re-assert Active via the status popover.
+            await self._go_online()
+            await self._emit("resumed", {"via": "status"})
+        except Exception as e:
+            log.warning("[%s] resume-available failed: %s", self.ext, e)
+
     # ── per-queue availability ───────────────────────────────────────────────────
 
     async def _set_queue_availability(self) -> int:
@@ -276,6 +308,12 @@ class AgentSession:
                     "ring_at": ring_at, "answer_at": answer_at,
                     "end_at": end_at, "duration": int(end_at - answer_at),
                 })
+
+                # After a call the portal drops the agent into "Wrap-up"
+                # (after-call-work) where the pill shows "Queue calls off" and
+                # NO new queue calls are delivered. Clear wrap-up / re-assert
+                # Active so the agent keeps answering subsequent queue calls.
+                await self._resume_available()
 
             except asyncio.CancelledError:
                 raise

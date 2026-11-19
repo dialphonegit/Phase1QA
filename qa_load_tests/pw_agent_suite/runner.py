@@ -18,7 +18,7 @@ class AgentRunner:
     def __init__(self, creds: list, hold: int = HOLD_SECONDS,
                  max_workers: int = MAX_WORKERS, broadcast: EventFn = None,
                  ramp_profile: str = "instant", ramp_duration: int = 60,
-                 num_agents: int | None = None):
+                 num_agents: int | None = None, headed_count: int = 0):
         # Honour the requested agent count (falls back to config NUM_AGENTS).
         n = num_agents if num_agents is not None else NUM_AGENTS
         self.creds        = creds[:n]
@@ -27,9 +27,13 @@ class AgentRunner:
         self.broadcast    = broadcast
         self.ramp_profile = ramp_profile
         self.ramp_duration = ramp_duration
+        # Run the first `headed_count` agents in a VISIBLE (headed) browser and
+        # the rest headless. 0 = all agents follow the global HEADLESS flag.
+        self.headed_count = max(0, min(headed_count, len(self.creds)))
         self.sessions:    dict[str, AgentSession] = {}
         self._pw          = None
-        self._browser: Browser = None
+        self._browser: Browser = None           # headless pool (or the single browser)
+        self._browser_headed: Browser = None     # visible browser for headed agents
         self._running     = False
         self._tasks:      list[asyncio.Task] = []
 
@@ -38,18 +42,31 @@ class AgentRunner:
         for c in self.creds:
             db.upsert_agent(c["extension"], c["email"], c.get("name", c["email"]))
 
+        launch_args = ["--no-sandbox", "--disable-dev-shm-usage",
+                       "--use-fake-ui-for-media-stream",
+                       # Real mic: auto-accept the getUserMedia prompt (fake-UI)
+                       # but feed the actual hardware microphone (no fake-device).
+                       "--disable-web-security"]
+
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage",
-                  "--use-fake-ui-for-media-stream",
-                  # Real mic: auto-accept the getUserMedia prompt (fake-UI) but feed
-                  # the actual hardware microphone (no fake-device flag).
-                  "--disable-web-security"],
-        )
+        if self.headed_count > 0:
+            # Mixed mode: a visible browser for the first `headed_count` agents,
+            # a headless browser for the rest. (Headless/headed can't be mixed
+            # within one Chromium process, so we launch two.)
+            self._browser_headed = await self._pw.chromium.launch(
+                headless=False, args=launch_args)
+            if self.headed_count < len(self.creds):
+                self._browser = await self._pw.chromium.launch(
+                    headless=True, args=launch_args)
+            log.info("Mixed mode | %d headed + %d headless | %d agents | ramp=%s",
+                     self.headed_count, len(self.creds) - self.headed_count,
+                     len(self.creds), self.ramp_profile)
+        else:
+            self._browser = await self._pw.chromium.launch(
+                headless=HEADLESS, args=launch_args)
+            log.info("Browser up | headless=%s | %d agents | ramp=%s",
+                     HEADLESS, len(self.creds), self.ramp_profile)
         self._running = True
-        log.info("Browser up | headless=%s | %d agents | ramp=%s",
-                 HEADLESS, len(self.creds), self.ramp_profile)
 
         sem = asyncio.Semaphore(self.max_workers)
         ramp = RampController(
@@ -57,8 +74,12 @@ class AgentRunner:
             broadcast=self.broadcast
         )
 
-        for cred in self.creds:
-            sess = AgentSession(cred, self._browser, self._on_event, self.hold)
+        for i, cred in enumerate(self.creds):
+            # First `headed_count` agents → visible browser; the rest → headless.
+            browser = (self._browser_headed
+                       if (self.headed_count > 0 and i < self.headed_count)
+                       else self._browser)
+            sess = AgentSession(cred, browser, self._on_event, self.hold)
             self.sessions[cred["extension"]] = sess
 
         delays = ramp.delays()
@@ -80,8 +101,12 @@ class AgentRunner:
             await s.stop()
         for t in self._tasks:
             t.cancel()
-        if self._browser:
-            await self._browser.close()
+        for br in (self._browser, self._browser_headed):
+            if br:
+                try:
+                    await br.close()
+                except Exception:
+                    pass
         if self._pw:
             await self._pw.stop()
         log.info("Runner stopped.")

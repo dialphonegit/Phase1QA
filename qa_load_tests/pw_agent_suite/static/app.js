@@ -30,6 +30,7 @@ function connect() {
   state.ws.onopen = () => {
     state.wsReady = true;
     addLog('sys', 'WebSocket connected');
+    syncRunState();   // reflect an already-running run (buttons miss the live start event)
   };
 
   state.ws.onclose = () => {
@@ -41,6 +42,19 @@ function connect() {
   state.ws.onmessage = e => {
     try { handleMsg(JSON.parse(e.data)); } catch {}
   };
+}
+
+// On (re)connect / page load, sync the Start/Stop buttons to the actual run
+// state so a run started before the page loaded still shows "Stop All".
+async function syncRunState() {
+  try {
+    const d = await (await fetch('/api/status')).json();
+    const running = !!d.running;
+    document.getElementById('btn-start').classList.toggle('hidden', running);
+    document.getElementById('btn-stop').classList.toggle('hidden', !running);
+    const ec = document.getElementById('btn-end-calls');
+    if (ec) ec.classList.toggle('hidden', !running);
+  } catch (e) { /* ignore */ }
 }
 
 function handleMsg(msg) {
@@ -671,6 +685,7 @@ function readSettings() {
     ramp_profile:   document.getElementById('cfg-ramp').value,
     ramp_duration: +document.getElementById('cfg-ramp-dur').value,
     headless:       document.getElementById('cfg-headless').checked,
+    headed_count:  +(document.getElementById('cfg-headed-count')?.value || 0),
     set_forwarding: document.getElementById('cfg-setfwd').checked,
     enable_guard:   document.getElementById('cfg-guard').checked,
     enable_alerts:  document.getElementById('cfg-alerts-en').checked,
