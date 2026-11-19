@@ -1,4 +1,5 @@
 """FastAPI server v3 — adds health-check, alerts, E2E mode, Prometheus /metrics, screenshots."""
+from __future__ import annotations
 import asyncio
 import builtins
 import json
@@ -99,7 +100,7 @@ class StartConfig(BaseModel):
     max_workers:    int   = MAX_WORKERS
     headless:       bool  = HEADLESS
     creds_file:     str   = CREDS_FILE
-    set_forwarding: bool  = True
+    set_forwarding: bool  = False
     enable_guard:   bool  = True
     enable_alerts:  bool  = True
     ramp_profile:   str   = "instant"
@@ -151,6 +152,14 @@ async def api_stop():
     _start_ts = 0.0
     await broadcast({"type": "runner_stopped"})
     return {"ok": True}
+
+@app.post("/api/calls/end-all")
+async def api_end_all_calls():
+    if not _runner:
+        return JSONResponse({"error": "not running"}, 409)
+    n = await _runner.end_all_calls()
+    await broadcast({"type": "calls_ended_all", "count": n})
+    return {"ok": True, "ended": n}
 
 @app.get("/api/status")
 async def api_status():

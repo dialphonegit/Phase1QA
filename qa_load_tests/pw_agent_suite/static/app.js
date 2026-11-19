@@ -554,6 +554,21 @@ async function stopAll() {
   toast('Stop requested', 'red');
 }
 
+async function endAllCalls() {
+  const btn = document.getElementById('btn-end-calls');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/calls/end-all', {method:'POST'});
+    const data = await r.json();
+    if (data.error) toast('End calls: '+data.error, 'red');
+    else toast(`Ended ${data.ended} active call${data.ended===1?'':'s'}`, 'amber');
+  } catch(e) {
+    toast('End calls error: '+e.message, 'red');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function startCallers() {
   const cfg = {
     num_callers:  +document.getElementById('cc-num').value,

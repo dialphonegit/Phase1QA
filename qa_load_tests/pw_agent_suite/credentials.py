@@ -13,6 +13,7 @@ Rate limiting is REAL and per-IP: the portal allows ~10 auth requests per
 window and returns HTTP 429 with a ``Retry-After`` header when exhausted. We
 honour that header and save creds incrementally so a long run is resumable.
 """
+from __future__ import annotations
 import json
 import time
 import asyncio

@@ -1,4 +1,5 @@
 """Orchestrate all agent sessions with ramp control and concurrency."""
+from __future__ import annotations
 import asyncio
 import logging
 from typing import Callable, Awaitable
@@ -42,7 +43,8 @@ class AgentRunner:
             headless=HEADLESS,
             args=["--no-sandbox", "--disable-dev-shm-usage",
                   "--use-fake-ui-for-media-stream",
-                  "--use-fake-device-for-media-stream",
+                  # Real mic: auto-accept the getUserMedia prompt (fake-UI) but feed
+                  # the actual hardware microphone (no fake-device flag).
                   "--disable-web-security"],
         )
         self._running = True
@@ -83,6 +85,22 @@ class AgentRunner:
         if self._pw:
             await self._pw.stop()
         log.info("Runner stopped.")
+
+    async def end_all_calls(self) -> int:
+        """Hang up every currently-active call across all agents.
+
+        Targets only sessions on a call (status 'on_call' or 'ringing'); agents
+        stay online and available afterwards. Returns the number hung up.
+        """
+        targets = [s for s in self.sessions.values()
+                   if s.status in ("on_call", "ringing")]
+        if not targets:
+            return 0
+        results = await asyncio.gather(*(s.end_call() for s in targets),
+                                       return_exceptions=True)
+        n = sum(1 for r in results if r is True)
+        log.info("End-all-calls: hung up %d of %d active", n, len(targets))
+        return n
 
     def snapshot(self) -> dict:
         return {ext: s.status for ext, s in self.sessions.items()}

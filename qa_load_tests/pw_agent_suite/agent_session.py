@@ -52,6 +52,7 @@ class AgentSession:
         try:
             await self._login()
             await self._go_online()
+            await self._set_queue_availability()
             await self._call_loop()
         except asyncio.CancelledError:
             pass
@@ -151,6 +152,88 @@ class AgentSession:
             except Exception:
                 pass
         await self._emit("online", {"status": self.status})
+
+    # ── per-queue availability ───────────────────────────────────────────────────
+
+    async def _set_queue_availability(self) -> int:
+        """Make this agent AVAILABLE in every assigned queue.
+
+        The portal gates queue calls per-queue: the "Campaigns & queues" panel's
+        "Assigned Queues" tab lists each queue with a toggle that reads
+        "Make Available" when the agent is currently unavailable there. This
+        opens that panel and clicks every "Make Available" button, so the agent
+        becomes available in all its assigned queues. Idempotent — queues already
+        available (button reads "Make Unavailable") are left untouched.
+
+        Returns the number of assigned queues the agent is available in afterwards.
+        """
+        try:
+            await self.page.wait_for_selector(SEL["queues_panel_btn"], timeout=8000)
+
+            # Opening the panel is a toggle, so confirm it actually opened (the
+            # "Assigned Queues" tab becomes visible) and re-click if a prior open
+            # state meant our click closed it instead.
+            opened = False
+            for _ in range(3):
+                await self.page.click(SEL["queues_panel_btn"])
+                await asyncio.sleep(1.0)
+                try:
+                    tab = await self.page.wait_for_selector(
+                        SEL["assigned_tab"], timeout=3000, state="visible")
+                    opened = True
+                    break
+                except Exception:
+                    continue
+            if not opened:
+                log.warning("[%s] could not open Campaigns & queues panel", self.ext)
+                return 0
+
+            # Select the "Assigned Queues" tab (best-effort; may already be active)
+            try:
+                await tab.click()
+                await asyncio.sleep(0.8)
+            except Exception:
+                pass
+
+            # Click every "Make Available" button. The list re-renders after each
+            # click (button flips to "Make Unavailable"), so re-query in a few passes.
+            made = 0
+            for _ in range(4):
+                btns = await self.page.query_selector_all(SEL["make_available_btn"])
+                if not btns:
+                    break
+                progressed = False
+                for b in btns:
+                    try:
+                        if await b.is_visible():
+                            await b.click()
+                            made += 1
+                            progressed = True
+                            await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+                if not progressed:
+                    break
+
+            available_now = len(await self.page.query_selector_all(
+                SEL["make_unavailable_btn"]))
+            self._queues_available = available_now
+            await self._screenshot("queues")
+            await self._emit("queues_available", {
+                "made_available": made, "available_total": available_now})
+            log.info("[%s] queues: made %d available, now available in %d",
+                     self.ext, made, available_now)
+
+            # Close the panel so it doesn't overlay later call widgets.
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return available_now
+        except Exception as e:
+            log.warning("[%s] set-queue-availability failed: %s", self.ext, e)
+            return 0
 
     # ── call loop ──────────────────────────────────────────────────────────────
 
@@ -273,6 +356,24 @@ class AgentSession:
         except Exception:
             pass
         return False
+
+    async def end_call(self) -> bool:
+        """Force-hang up this agent's current call immediately.
+
+        Used by the dashboard "End all calls" button. Best-effort: clicks the
+        hangup control now; the running call loop's own post-hold hangup then
+        becomes a harmless no-op. Does NOT stop the agent — it stays online and
+        available for the next queue call.
+        """
+        try:
+            await self._hangup()
+            self.status = "idle"
+            await self._emit("call_ended", {"forced": True,
+                                            "end_at": time.time()})
+            return True
+        except Exception as e:
+            log.warning("[%s] end_call failed: %s", self.ext, e)
+            return False
 
     async def _hangup(self):
         """Hang up the call using multiple fallback strategies."""

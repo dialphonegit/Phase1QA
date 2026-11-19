@@ -48,6 +48,17 @@ SEL = {
     # After clicking status_btn a popover opens; "Active ✓" = queue calls on
     "online_opt":   '[data-slot="popover-content"] button:has-text("Active")',
 
+    # Per-queue availability — the "Campaigns & queues" headset icon opens a panel
+    # with a "Assigned Queues" tab; each queue row has a toggle button that reads
+    # "Make Available" when the agent is currently UNavailable in that queue, and
+    # "Make Unavailable" when already available. (:text-is = exact, so "Make
+    # Available" never matches the "Make Unavailable" label.)
+    "queues_panel_btn":     'button[aria-label="Campaigns & queues"]',
+    "assigned_tab":         '[data-slot="tabs-trigger"]:has-text("Assigned Queues"), '
+                            '[role="tab"]:has-text("Assigned Queues")',
+    "make_available_btn":   'button:text-is("Make Available")',
+    "make_unavailable_btn": 'button:text-is("Make Unavailable")',
+
     # Incoming call widget — portal shows a Toastify toast or fixed overlay.
     # The toast container is always present; actual ringing call appears as a child.
     # We wait for a button containing a green phone icon (Answer) inside the toast area.
