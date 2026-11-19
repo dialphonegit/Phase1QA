@@ -176,10 +176,33 @@ function handleMsg(msg) {
   }
 
   if (type === 'fetch_progress') {
-    const pct = Math.round(msg.done/msg.total*100);
-    document.getElementById('fetch-bar').style.width = pct + '%';
-    document.getElementById('fetch-txt').textContent =
-      `${msg.done}/${msg.total} — ${msg.email} ${msg.ok?'✓':'✗'} — ETA ${msg.eta_min}min`;
+    const pct = Math.round(msg.done / msg.total * 100);
+    const prog = document.getElementById('fetch-prog');
+    const bar  = document.getElementById('fetch-bar');
+    const txt  = document.getElementById('fetch-txt');
+    if (prog) prog.classList.remove('hidden');
+    if (bar)  bar.style.width = pct + '%';
+    const done = msg.done >= msg.total;
+    const label = done
+      ? `✅ Done — ${msg.total} creds saved`
+      : `${msg.done}/${msg.total} (${pct}%) — ${msg.email} ${msg.ok ? '✓' : '✗'} — ETA ${msg.eta_min}min`;
+    if (txt) txt.textContent = label;
+    // Also show a persistent banner at top of page
+    let banner = document.getElementById('fetch-banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'fetch-banner';
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:#1e1b4b;border-bottom:2px solid #7c3aed;padding:6px 16px;font-size:0.78rem;display:flex;align-items:center;gap:10px;';
+      document.body.prepend(banner);
+    }
+    banner.innerHTML = done
+      ? `<span style="color:#4ade80;font-weight:600">✅ Credentials ready — ${msg.total} agents fetched</span><button onclick="this.parentElement.remove()" style="margin-left:auto;color:#9ca3af;cursor:pointer">✕</button>`
+      : `<span style="color:#a78bfa;font-weight:600">⬇ Fetching creds…</span>
+         <div style="flex:1;height:6px;background:#312e81;border-radius:3px;overflow:hidden">
+           <div style="height:100%;width:${pct}%;background:#7c3aed;border-radius:3px;transition:width .4s"></div>
+         </div>
+         <span style="color:#c4b5fd;white-space:nowrap">${msg.done}/${msg.total} (${pct}%) · ETA ${msg.eta_min}min</span>`;
+    if (done) setTimeout(() => banner && banner.remove(), 5000);
     addLog('fetch', `fetch ${msg.done}/${msg.total} ${msg.email}`);
     return;
   }
