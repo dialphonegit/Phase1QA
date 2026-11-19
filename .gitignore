@@ -1,2 +1,13 @@
 __pycache__/
 *.pyc
+
+# Python virtualenvs
+.venv/
+venv/
+env/
+
+# Playwright / runtime artifacts
+pw_report.html
+*.log
+/tmp/
+qa_load_tests/pw_agent_suite/.venv/

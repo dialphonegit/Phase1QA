@@ -123,7 +123,8 @@ async def api_start(cfg: StartConfig):
     config.NUM_AGENTS  = cfg.num_agents
 
     _runner = AgentRunner(cred_list, cfg.hold_seconds, cfg.max_workers, broadcast,
-                          cfg.ramp_profile, cfg.ramp_duration)
+                          cfg.ramp_profile, cfg.ramp_duration,
+                          num_agents=cfg.num_agents)
     _bg_tasks.append(asyncio.create_task(_runner.start()))
     _start_ts = time.time()
 

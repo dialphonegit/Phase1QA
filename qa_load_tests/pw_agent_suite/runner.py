@@ -16,8 +16,11 @@ EventFn = Callable[[dict], Awaitable[None]]
 class AgentRunner:
     def __init__(self, creds: list, hold: int = HOLD_SECONDS,
                  max_workers: int = MAX_WORKERS, broadcast: EventFn = None,
-                 ramp_profile: str = "instant", ramp_duration: int = 60):
-        self.creds        = creds[:NUM_AGENTS]
+                 ramp_profile: str = "instant", ramp_duration: int = 60,
+                 num_agents: int | None = None):
+        # Honour the requested agent count (falls back to config NUM_AGENTS).
+        n = num_agents if num_agents is not None else NUM_AGENTS
+        self.creds        = creds[:n]
         self.hold         = hold
         self.max_workers  = max_workers
         self.broadcast    = broadcast

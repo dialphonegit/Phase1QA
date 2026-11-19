@@ -78,22 +78,24 @@ class AgentSession:
         token = self.cred.get("token")
         if token:
             await self.page.goto(f"{PORTAL_URL}/login", wait_until="domcontentloaded")
+            # The portal stores the auth JWT under localStorage key "web-token".
             await self.page.evaluate(f"""() => {{
                 const t={repr(token)};
-                ['token','authToken','access_token','auth_token','jwt'].forEach(k=>localStorage.setItem(k,t));
-                try{{const u=JSON.parse(localStorage.getItem('user')||'{{}}');u.token=t;localStorage.setItem('user',JSON.stringify(u));}}catch{{}}
+                localStorage.setItem('web-token', t);
+                localStorage.setItem('lang', 'en');
             }}""")
-            await self.page.goto(f"{PORTAL_URL}/", wait_until="networkidle")
+            await self.page.goto(f"{PORTAL_URL}/dashboard", wait_until="domcontentloaded")
+            await self.page.wait_for_timeout(4000)  # let the SPA hydrate + SIP connect
             if "/login" not in self.page.url:
                 await self._dismiss_modals()
                 await self._emit("logged_in", {"method": "token"})
                 return
 
-        await self.page.goto(f"{PORTAL_URL}/login", wait_until="networkidle")
+        await self.page.goto(f"{PORTAL_URL}/login", wait_until="domcontentloaded")
         await self._screenshot("login")
         await self.page.fill(SEL["email"], self.email)
         await self.page.fill(SEL["password"], AGENT_WEB_PASS)
-        async with self.page.expect_navigation(wait_until="networkidle", timeout=20000):
+        async with self.page.expect_navigation(wait_until="domcontentloaded", timeout=20000):
             await self.page.click(SEL["submit"])
         await self._dismiss_modals()
         await self._emit("logged_in", {"method": "form"})
